@@ -22,8 +22,38 @@ declare global {
 const isPostgresUrl = (url?: string | null) =>
   !!url && /^postgres(ql)?:\/\//.test(url);
 
+const isServerless = () =>
+  !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
+
+/**
+ * Find a Postgres connection string from the environment.
+ *
+ * Prefers an explicit DATABASE_URL, but also auto-detects the variables the
+ * Vercel/Neon integration creates — which may be prefixed (e.g. when the
+ * storage is connected with a custom prefix you get DATABASE_URL_POSTGRES_URL,
+ * DATABASE_URL_DATABASE_URL, etc.). Pooled URLs are preferred for serverless.
+ */
+function resolveDatabaseUrl(): string | undefined {
+  if (isPostgresUrl(process.env.DATABASE_URL)) return process.env.DATABASE_URL;
+
+  const rank = (name: string): number => {
+    if (/(^|_)POSTGRES_URL$/.test(name)) return 0; // pooled connection
+    if (/(^|_)DATABASE_URL$/.test(name)) return 1;
+    if (/POSTGRES_PRISMA_URL$/.test(name)) return 2;
+    if (/POSTGRES_URL_NON_POOLING$/.test(name)) return 3;
+    if (/(^|_)POSTGRES_URL_NO_SSL$/.test(name)) return 4;
+    return 9;
+  };
+
+  const candidate = Object.entries(process.env)
+    .filter(([, v]) => isPostgresUrl(v))
+    .sort(([a], [b]) => rank(a) - rank(b))[0];
+
+  return candidate?.[1];
+}
+
 async function createClient(): Promise<DbClient> {
-  const url = process.env.DATABASE_URL;
+  const url = resolveDatabaseUrl();
 
   if (isPostgresUrl(url)) {
     const { neon } = await import("@neondatabase/serverless");
@@ -41,6 +71,16 @@ async function createClient(): Promise<DbClient> {
     };
     await ensureSchema(client);
     return client;
+  }
+
+  // No Postgres URL found. PGlite writes to disk, which is read-only on
+  // serverless — so fail loudly with guidance instead of an EROFS crash.
+  if (isServerless()) {
+    throw new Error(
+      "No Postgres connection string found. Connect a Neon/Postgres database " +
+        "and expose its URL as DATABASE_URL (or POSTGRES_URL / *_POSTGRES_URL), " +
+        "then redeploy."
+    );
   }
 
   // Local fallback: PGlite (Postgres in WASM, persisted to disk).
