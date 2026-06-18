@@ -57,15 +57,17 @@ async function createClient(): Promise<DbClient> {
 
   if (isPostgresUrl(url)) {
     const { neon } = await import("@neondatabase/serverless");
-    const sql = neon(url!);
+    // neon's HTTP driver: the returned function runs a parameterized query when
+    // called directly as sql(queryText, paramsArray). With default options it
+    // resolves to an array of row objects. (There is no sql.query in this build.)
+    const sql = neon(url!) as unknown as (
+      t: string,
+      p: unknown[]
+    ) => Promise<Row[] | { rows: Row[] }>;
     const client: DbClient = {
       query: async (text, params = []) => {
-        // neon's parameterized .query(text, params) exists at runtime; its
-        // type signature doesn't expose it, so we call through a typed shim.
-        const run = (sql as unknown as {
-          query: (t: string, p: unknown[]) => Promise<Row[]>;
-        }).query;
-        const rows = await run(text, params);
+        const result = await sql(text, params);
+        const rows = Array.isArray(result) ? result : result?.rows ?? [];
         return { rows };
       },
     };
